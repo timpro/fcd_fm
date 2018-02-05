@@ -12,15 +12,18 @@
 #include <math.h>
 #include <alsa/asoundlib.h>
 
-snd_pcm_t *OpenSource()
+static snd_pcm_t *fcd_handle;
+int OpenSource()
 {
-	int fail = 0;
+	int fail;
 	snd_pcm_hw_params_t* params;
-	snd_pcm_t* fcd_handle = NULL;
 	snd_pcm_stream_t fcd_stream = SND_PCM_STREAM_CAPTURE;
 
-	if ( snd_pcm_open( &fcd_handle, "hw:CARD=V20", fcd_stream, 0 ) < 0 )
-		return NULL;
+	fail = snd_pcm_open( &fcd_handle, "hw:CARD=V20", fcd_stream, 0 );
+	if (fail < 0 ) {
+		fprintf(stderr, "Failed to open Funcube Dongle with error: %d\n", fail);
+		return fail;
+	}
 
 	snd_pcm_hw_params_alloca(&params);
 	if ( snd_pcm_hw_params_any(fcd_handle, params) < 0 )
@@ -35,23 +38,24 @@ snd_pcm_t *OpenSource()
 	if (fail) {
 		fprintf(stderr, "Funcube Dongle stream start failed\n");
 		snd_pcm_close( fcd_handle );
-		return NULL;
+		return -1;
 	} else {
 		fprintf(stderr, "Funcube stream started\n");
 	}
-	return fcd_handle;
+	return 0;
 }
 
-void CloseSource(snd_pcm_t *fcd_handle)
+void CloseSource()
 {
-	if (fcd_handle)
-		snd_pcm_close( fcd_handle );
+	snd_pcm_close( fcd_handle );
 }
 
-#define BLOCKSIZE 4000
 void downsample(int16_t* buf, float *I, float *Q, int len)
 {
-	// Offset tuning: 4x downsample and rotate by one quarter. [ rotate:  0, 1, -3, 2, -4, -5, 7, -6]
+	// Offset tuning to remove dc spike: tune 48kHz high
+	// 4x downsample and rotate by one quarter.
+	// rotate:  (0, 1), (-3, 2), (-4, -5), (7, -6)
+	// downsample: (0 -3 -4 +7), (1 +2 -5 -6])
 	int i, pos;
 
 	for (i = pos = 0; pos < len - 7; pos += 8) {
@@ -61,23 +65,29 @@ void downsample(int16_t* buf, float *I, float *Q, int len)
 	}
 }
 
+#define RESCALE (24000.0f / 3.14159265f)
+static float dc = 0.0f;
 static float lastI = 0.1f;
 static float lastQ = 0.1f;
 void demodulate(int16_t audio[], float I[], float Q[], int len)
 {
-	float cr, cj, angle;
+	float cr, cj, angle, sum;
 
+	sum = 0.0f;
 	for (int i = 0; i < len; i++) {
 		cr = I[i] * lastI + Q[i] * lastQ;
 		cj = Q[i] * lastI - I[i] * lastQ;
 		angle = atan2f(cj, cr);
-		audio[i] = (int16_t)(angle * (31400.0 / M_PI) );
+		sum += angle;
+		audio[i] = (int16_t)((angle - dc ) * RESCALE);
 		lastI = I[i];
 		lastQ = Q[i];
 	}
+	dc = 0.9f * dc + 0.1 * sum / len;
 }
 
-int work(snd_pcm_t *fcd_handle)
+#define BLOCKSIZE 4000
+int work()
 {
 	int l;
 	int16_t audio192[BLOCKSIZE * 4 * 2];
@@ -90,9 +100,9 @@ int work(snd_pcm_t *fcd_handle)
 	l = snd_pcm_mmap_readi(fcd_handle, out, (snd_pcm_uframes_t)BLOCKSIZE * 4);
 	if (l <= 0)
 		return 0;
-	downsample(audio192, i48khz, q48khz, l);
+	downsample(audio192, i48khz, q48khz, l << 1); // double length for IQ stereo input
 	// TODO: low pass filter - only need 12 kHz for nfm
-	demodulate(audio48, i48khz, q48khz, l >> 2);
+	demodulate(audio48, i48khz, q48khz, l >> 2); // quarter rate for 192k in / 48k out
 	fwrite(audio48, 2, l >> 2, stdout);
 
 	return l; // until signal caught
@@ -118,11 +128,9 @@ void sighandler(int signum)
 
 int main()
 {
-	snd_pcm_t *fcd_handle;
 	struct sigaction sigact;
 
-	fcd_handle = OpenSource();
-	if (!fcd_handle)
+	if ( OpenSource() )
 		return -ENODEV;
 
 	writewavheader(stdout);
@@ -135,8 +143,8 @@ int main()
 	sigaction(SIGQUIT, &sigact, NULL);
 	sigaction(SIGPIPE, &sigact, NULL);
 
-	while ( work( fcd_handle ) && !stopped )
+	while ( work() && !stopped )
 		;
-	CloseSource( fcd_handle );
+	CloseSource();
 	return 0;
 }
